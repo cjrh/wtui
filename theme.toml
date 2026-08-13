@@ -1,0 +1,24 @@
+name = "wtui Dark"
+
+[variables]
+bg        = "#191b26"
+bg-raised = "#22252f"
+text      = "#cdd3e0"
+primary   = "#7aa2f7"
+success   = "#9ece6a"
+warning   = "#e0af68"
+danger    = "#f7768e"
+
+[palette]
+background = "$bg"
+text       = "$text"
+primary    = "$primary"
+success    = "$success"
+warning    = "$warning"
+danger     = "$danger"
+
+[container]
+background    = "$bg-raised"
+border-radius = 10.0
+border-width  = 1.0
+border-color  = "#ffffff12"

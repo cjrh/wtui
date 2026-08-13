@@ -1,0 +1,22 @@
+[package]
+name = "wtui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# Use iced's CPU renderer. This avoids GPU context loss on Linux after sleep.
+iced = { version = "0.14", default-features = false, features = [
+    "tiny-skia",
+    "tokio",
+    "web-colors",
+    "x11",
+    "wayland",
+] }
+iced-themer = { path = "../iced-themer" }
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+tokio = { version = "1", features = ["rt"] }
+wait-timeout = "0.2"
