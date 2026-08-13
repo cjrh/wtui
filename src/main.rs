@@ -15,7 +15,8 @@ use std::{
 };
 
 use iced::widget::{
-    button, center, column, container, mouse_area, opaque, row, scrollable, stack, text, text_input,
+    button, center, column, container, mouse_area, opaque, rich_text, row, scrollable, span, stack,
+    text, text_input,
 };
 use iced::{
     Alignment, Border, Color, Element, Length, Size, Subscription, Task, color, theme::Palette,
@@ -28,7 +29,6 @@ use wait_timeout::ChildExt;
 const THEME_TOML: &str = include_str!("../theme.toml");
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_DIFF_BYTES: usize = 250_000;
 
 const SIZE_TITLE: f32 = 30.0;
 const SIZE_HEADING: f32 = 18.0;
@@ -77,7 +77,7 @@ struct State {
     repositories: Vec<Repository>,
     selected_root: Option<String>,
     selected_worktree: Option<WorktreeKey>,
-    diff: DiffState,
+    pull_request: PullRequestStatus,
     modal: Option<Modal>,
     banner: Option<Banner>,
     config_saving: bool,
@@ -116,17 +116,29 @@ struct WorktreeKey {
 }
 
 #[derive(Debug, Clone)]
-enum DiffState {
-    Empty,
+enum PullRequestStatus {
+    Idle,
     Loading,
-    Loaded(Diff),
+    Found(PullRequest),
+    NotFound,
     Error(String),
 }
 
-#[derive(Debug, Clone)]
-struct Diff {
-    base: String,
-    contents: String,
+#[derive(Debug, Clone, Deserialize)]
+struct PullRequest {
+    number: u64,
+    url: String,
+    state: String,
+    #[serde(rename = "headRefName")]
+    head_branch: String,
+    #[serde(rename = "mergedAt")]
+    merged_at: Option<String>,
+}
+
+impl PullRequest {
+    fn is_merged(&self) -> bool {
+        self.state == "MERGED" || self.merged_at.is_some()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +152,7 @@ enum Modal {
         path: PathBuf,
         dirty_files: usize,
         ignored_files: usize,
+        delete_branch: Option<String>,
     },
 }
 
@@ -177,16 +190,19 @@ enum Msg {
         result: Result<PathBuf, String>,
     },
     WorktreeSelected(WorktreeKey),
-    DiffLoaded {
+    PullRequestLoaded {
         key: WorktreeKey,
-        result: Result<Diff, String>,
+        result: Result<Option<PullRequest>, String>,
     },
+    OpenPullRequestUrl(String),
+    PullRequestUrlOpened(Result<(), String>),
     AskRemoveWorktree(WorktreeKey),
+    AskRemoveMergedWorktree(WorktreeKey),
     ConfirmRemoveWorktree,
     WorktreeRemoved {
         root_id: String,
         path: PathBuf,
-        result: Result<(), String>,
+        result: Result<RemovalOutcome, String>,
     },
     DismissModal,
 }
@@ -197,7 +213,7 @@ fn boot(theme: Arc<ThemeConfig>) -> (State, Task<Msg>) {
         repositories: Vec::new(),
         selected_root: None,
         selected_worktree: None,
-        diff: DiffState::Empty,
+        pull_request: PullRequestStatus::Idle,
         modal: None,
         banner: None,
         config_saving: false,
@@ -319,7 +335,7 @@ fn update(state: &mut State, msg: Msg) -> Task<Msg> {
             {
                 state.selected_root = Some(root_id);
                 state.selected_worktree = None;
-                state.diff = DiffState::Empty;
+                state.pull_request = PullRequestStatus::Idle;
             }
             Task::none()
         }
@@ -354,7 +370,7 @@ fn update(state: &mut State, msg: Msg) -> Task<Msg> {
             }
             if removed_selection {
                 state.selected_worktree = None;
-                state.diff = DiffState::Empty;
+                state.pull_request = PullRequestStatus::Idle;
             }
             Task::none()
         }
@@ -431,19 +447,32 @@ fn update(state: &mut State, msg: Msg) -> Task<Msg> {
         Msg::WorktreeSelected(key) => {
             let path = key.path.clone();
             state.selected_worktree = Some(key.clone());
-            state.diff = DiffState::Loading;
-            Task::perform(background(move || load_diff(path)), move |result| {
-                Msg::DiffLoaded { key, result }
+            state.pull_request = PullRequestStatus::Loading;
+            Task::perform(background(move || load_pull_request(path)), move |result| {
+                Msg::PullRequestLoaded { key, result }
             })
         }
-        Msg::DiffLoaded { key, result } => {
+        Msg::PullRequestLoaded { key, result } => {
             if state.selected_worktree.as_ref() != Some(&key) {
                 return Task::none();
             }
-            state.diff = match result {
-                Ok(diff) => DiffState::Loaded(diff),
-                Err(message) => DiffState::Error(message),
+            state.pull_request = match result {
+                Ok(Some(pull_request)) => PullRequestStatus::Found(pull_request),
+                Ok(None) => PullRequestStatus::NotFound,
+                Err(message) => PullRequestStatus::Error(message),
             };
+            Task::none()
+        }
+        Msg::OpenPullRequestUrl(url) => Task::perform(
+            background(move || open::that(&url).map_err(|error| error.to_string())),
+            Msg::PullRequestUrlOpened,
+        ),
+        Msg::PullRequestUrlOpened(Ok(())) => Task::none(),
+        Msg::PullRequestUrlOpened(Err(error)) => {
+            state.banner = Some(Banner {
+                level: BannerLevel::Error,
+                message: format!("Could not open the pull request URL: {error}"),
+            });
             Task::none()
         }
         Msg::AskRemoveWorktree(key) => {
@@ -461,8 +490,28 @@ fn update(state: &mut State, msg: Msg) -> Task<Msg> {
                     path: key.path,
                     dirty_files: worktree.dirty_files,
                     ignored_files: worktree.ignored_files,
+                    delete_branch: None,
                 });
             }
+            Task::none()
+        }
+        Msg::AskRemoveMergedWorktree(key) => {
+            let Some(worktree) = find_worktree(state, &key).cloned() else {
+                return Task::none();
+            };
+            let can_remove_branch = !worktree.is_main
+                && worktree.branch.is_some()
+                && matches!(&state.pull_request, PullRequestStatus::Found(pr) if pr.is_merged());
+            if !can_remove_branch {
+                return Task::none();
+            }
+            state.modal = Some(Modal::RemoveWorktree {
+                root_id: key.root_id,
+                path: key.path,
+                dirty_files: worktree.dirty_files,
+                ignored_files: worktree.ignored_files,
+                delete_branch: worktree.branch,
+            });
             Task::none()
         }
         Msg::ConfirmRemoveWorktree => {
@@ -471,6 +520,7 @@ fn update(state: &mut State, msg: Msg) -> Task<Msg> {
                 path,
                 dirty_files,
                 ignored_files,
+                delete_branch,
             }) = state.modal.clone()
             else {
                 return Task::none();
@@ -486,9 +536,13 @@ fn update(state: &mut State, msg: Msg) -> Task<Msg> {
             state.modal = None;
             state.banner = None;
             let path_for_worker = path.clone();
+            let force = dirty_files > 0 || ignored_files > 0;
             Task::perform(
-                background(move || {
-                    remove_worktree(root, path_for_worker, dirty_files > 0 || ignored_files > 0)
+                background(move || match delete_branch {
+                    Some(branch) => {
+                        remove_merged_worktree_and_branch(root, path_for_worker, branch, force)
+                    }
+                    None => remove_worktree(root, path_for_worker, force, None),
                 }),
                 move |result| Msg::WorktreeRemoved {
                     root_id,
@@ -506,16 +560,31 @@ fn update(state: &mut State, msg: Msg) -> Task<Msg> {
                 repository.changing = false;
             }
             match result {
-                Ok(()) => {
+                Ok(outcome) => {
                     if state.selected_worktree.as_ref().is_some_and(|selection| {
                         selection.root_id == root_id && selection.path == path
                     }) {
                         state.selected_worktree = None;
-                        state.diff = DiffState::Empty;
+                        state.pull_request = PullRequestStatus::Idle;
                     }
-                    state.banner = Some(Banner {
-                        level: BannerLevel::Success,
-                        message: format!("Removed worktree at {}.", path.display()),
+                    state.banner = Some(match outcome.branch_deletion_error {
+                        Some(error) => Banner {
+                            level: BannerLevel::Info,
+                            message: format!(
+                                "Removed worktree at {}, but could not delete its local branch: {error}",
+                                path.display()
+                            ),
+                        },
+                        None => Banner {
+                            level: BannerLevel::Success,
+                            message: match outcome.deleted_branch {
+                                Some(branch) => format!(
+                                    "Removed worktree at {} and local branch {branch}.",
+                                    path.display()
+                                ),
+                                None => format!("Removed worktree at {}.", path.display()),
+                            },
+                        },
                     });
                     request_refresh(state, &root_id)
                 }
@@ -763,7 +832,18 @@ fn add_worktree(root: PathBuf, branch: String) -> Result<PathBuf, String> {
     Ok(target)
 }
 
-fn remove_worktree(root: PathBuf, target: PathBuf, force: bool) -> Result<(), String> {
+#[derive(Debug, Clone)]
+struct RemovalOutcome {
+    deleted_branch: Option<String>,
+    branch_deletion_error: Option<String>,
+}
+
+fn remove_worktree(
+    root: PathBuf,
+    target: PathBuf,
+    force: bool,
+    expected_branch: Option<&str>,
+) -> Result<RemovalOutcome, String> {
     let worktrees = parse_worktree_list(&git(&root, &["worktree", "list", "--porcelain"])?)?;
     let target =
         fs::canonicalize(&target).map_err(|error| format!("{}: {error}", target.display()))?;
@@ -775,6 +855,11 @@ fn remove_worktree(root: PathBuf, target: PathBuf, force: bool) -> Result<(), St
     };
     if worktree.path == root {
         return Err("the root worktree cannot be removed".to_owned());
+    }
+    if let Some(expected_branch) = expected_branch
+        && worktree.branch.as_deref() != Some(expected_branch)
+    {
+        return Err("the worktree branch changed before removal".to_owned());
     }
     let status = status_summary(&worktree.path)?;
     if (status.dirty_files > 0 || status.ignored_files > 0) && !force {
@@ -789,109 +874,73 @@ fn remove_worktree(root: PathBuf, target: PathBuf, force: bool) -> Result<(), St
     }
     arguments.push(worktree.path.to_string_lossy().into_owned());
     git_with_args(&root, arguments)?;
-    Ok(())
-}
-
-fn load_diff(path: PathBuf) -> Result<Diff, String> {
-    let base = resolve_diff_base(&path)?;
-    let range = format!("{}...HEAD", base.reference);
-    let contents = truncate_diff(git_with_args(
-        &path,
-        [
-            "diff".to_owned(),
-            "--no-ext-diff".to_owned(),
-            "--color=never".to_owned(),
-            range,
-            "--".to_owned(),
-        ],
-    )?);
-    Ok(Diff {
-        base: base.description,
-        contents,
+    Ok(RemovalOutcome {
+        deleted_branch: None,
+        branch_deletion_error: None,
     })
 }
 
-#[derive(Debug, Clone)]
-struct DiffBase {
-    reference: String,
-    description: String,
-}
-
-fn resolve_diff_base(path: &Path) -> Result<DiffBase, String> {
-    if let Some(branch) = github_pr_base(path)
-        && let Some(reference) = resolve_branch_reference(path, &branch)
-    {
-        return Ok(DiffBase {
-            reference,
-            description: format!("GitHub PR base: {branch}"),
-        });
-    }
-
-    if reference_exists(path, "@{upstream}") {
-        return Ok(DiffBase {
-            reference: "@{upstream}".to_owned(),
-            description: "upstream branch".to_owned(),
-        });
-    }
-
-    let remotes = git(path, &["remote"])?;
-    for remote in remotes
-        .lines()
-        .map(str::trim)
-        .filter(|remote| !remote.is_empty())
-    {
-        let symbolic = format!("refs/remotes/{remote}/HEAD");
-        if let Ok(reference) = git(path, &["symbolic-ref", "--quiet", "--short", &symbolic]) {
-            let reference = reference.trim().to_owned();
-            if reference_exists(path, &reference) {
-                return Ok(DiffBase {
-                    reference: reference.clone(),
-                    description: format!("{remote} default branch ({reference})"),
-                });
-            }
+/// Remove a worktree and its local branch only after GitHub confirms the PR is
+/// still merged. `git branch -D` is safe here because the GitHub check is made
+/// immediately before the destructive action; it also works before the root
+/// worktree has fetched the merged commit.
+fn remove_merged_worktree_and_branch(
+    root: PathBuf,
+    target: PathBuf,
+    branch: String,
+    force: bool,
+) -> Result<RemovalOutcome, String> {
+    match load_pull_request(target.clone())? {
+        Some(pull_request) if pull_request.is_merged() && pull_request.head_branch == branch => {}
+        Some(pull_request) if !pull_request.is_merged() => {
+            return Err("the pull request is no longer merged".to_owned());
         }
+        Some(_) => return Err("the merged pull request belongs to another branch".to_owned()),
+        None => return Err("no GitHub pull request is available to verify as merged".to_owned()),
     }
 
-    Err("no PR base, upstream branch, or local remote default branch is available".to_owned())
+    remove_worktree(root.clone(), target, force, Some(&branch))?;
+    let branch_deletion_error = git_with_args(
+        &root,
+        [
+            "branch".to_owned(),
+            "-D".to_owned(),
+            "--".to_owned(),
+            branch.clone(),
+        ],
+    )
+    .err();
+    Ok(RemovalOutcome {
+        deleted_branch: branch_deletion_error.is_none().then_some(branch),
+        branch_deletion_error,
+    })
 }
 
-fn github_pr_base(path: &Path) -> Option<String> {
-    let branch = run_command(
+/// Read the PR only when a worktree is selected. The five-second refresh never
+/// calls GitHub, so it stays cheap and works offline.
+fn load_pull_request(path: PathBuf) -> Result<Option<PullRequest>, String> {
+    let output = match run_command(
         "gh",
-        path,
+        &path,
         [
             "pr".to_owned(),
             "view".to_owned(),
             "--json".to_owned(),
-            "baseRefName".to_owned(),
-            "--jq".to_owned(),
-            ".baseRefName".to_owned(),
+            "number,url,state,mergedAt,headRefName".to_owned(),
         ],
-    )
-    .ok()?
-    .trim()
-    .to_owned();
-    (!branch.is_empty()).then_some(branch)
+    ) {
+        Ok(output) => output,
+        Err(error) if no_pull_request_error(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    serde_json::from_str(&output)
+        .map(Some)
+        .map_err(|error| format!("could not parse GitHub CLI output: {error}"))
 }
 
-fn resolve_branch_reference(path: &Path, branch: &str) -> Option<String> {
-    let mut candidates = vec![format!("refs/heads/{branch}")];
-    let remotes = git(path, &["remote"]).ok()?;
-    candidates.extend(
-        remotes
-            .lines()
-            .map(str::trim)
-            .filter(|remote| !remote.is_empty())
-            .map(|remote| format!("refs/remotes/{remote}/{branch}")),
-    );
-    candidates
-        .into_iter()
-        .find(|reference| reference_exists(path, reference))
-}
-
-fn reference_exists(path: &Path, reference: &str) -> bool {
-    let revision = format!("{reference}^{{commit}}");
-    git(path, &["rev-parse", "--verify", "--quiet", &revision]).is_ok()
+fn no_pull_request_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("no pull request found") || error.contains("no pull requests found")
 }
 
 fn git(path: &Path, arguments: &[&str]) -> Result<String, String> {
@@ -909,8 +958,8 @@ fn git_with_args(
 }
 
 /// Run a command with bounded wall time while draining both output streams.
-/// Draining in separate threads prevents a large `git diff` from filling a pipe
-/// and blocking before the timeout can be checked.
+/// Draining in separate threads prevents a command with large output from
+/// filling a pipe and blocking before the timeout can be checked.
 fn run_command(
     program: &str,
     path: &Path,
@@ -1095,19 +1144,6 @@ fn slugify(value: &str) -> String {
     }
 }
 
-fn truncate_diff(mut diff: String) -> String {
-    if diff.len() <= MAX_DIFF_BYTES {
-        return diff;
-    }
-    let mut end = MAX_DIFF_BYTES;
-    while !diff.is_char_boundary(end) {
-        end -= 1;
-    }
-    diff.truncate(end);
-    diff.push_str("\n\n… diff truncated by wtui …\n");
-    diff
-}
-
 // ── View ───────────────────────────────────────────────────────────────────
 
 fn view(state: &State) -> Element<'_, Msg> {
@@ -1226,7 +1262,7 @@ fn main_content<'a>(state: &'a State, palette: &Palette) -> Element<'a, Msg> {
         .as_deref()
         .and_then(|id| repository(state, id))
     {
-        Some(repository) => worktree_and_diff(state, repository, palette),
+        Some(repository) => worktree_overview(state, repository, palette),
         None => text("Select a repository.").size(SIZE_BODY).into(),
     };
 
@@ -1275,7 +1311,7 @@ fn tab_button<'a>(
     .into()
 }
 
-fn worktree_and_diff<'a>(
+fn worktree_overview<'a>(
     state: &'a State,
     repository: &'a Repository,
     palette: &Palette,
@@ -1316,9 +1352,9 @@ fn worktree_and_diff<'a>(
         .width(Length::FillPortion(5))
         .height(Length::Fill)
         .themed(state.theme.container());
-    let diff = diff_panel(state, palette);
+    let details = worktree_details_panel(state, palette);
 
-    row![worktrees, diff]
+    row![worktrees, details]
         .spacing(12)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -1434,45 +1470,139 @@ fn worktree_status(worktree: &Worktree) -> String {
     status
 }
 
-fn diff_panel<'a>(state: &'a State, palette: &Palette) -> Element<'a, Msg> {
-    let body: Element<_> = match &state.diff {
-        DiffState::Empty => column![
-            text("Branch diff").size(SIZE_HEADING).color(palette.text),
-            text("Select a worktree to compare it with its PR base branch.")
+fn worktree_details_panel<'a>(state: &'a State, palette: &Palette) -> Element<'a, Msg> {
+    let text_color = palette.text;
+    let primary = palette.primary;
+    let danger = palette.danger;
+    let success = palette.success;
+    let body: Element<_> = match state
+        .selected_worktree
+        .as_ref()
+        .and_then(|key| find_worktree(state, key).map(|worktree| (key, worktree)))
+    {
+        None => column![
+            text("Worktree details")
+                .size(SIZE_HEADING)
+                .color(text_color),
+            text("Select a worktree to see its status and pull request.")
                 .size(SIZE_SMALL)
-                .color(dim(palette.text, 0.6)),
+                .color(dim(text_color, 0.6)),
         ]
         .spacing(8)
         .into(),
-        DiffState::Loading => column![
-            text("Branch diff").size(SIZE_HEADING).color(palette.text),
-            text("Loading diff…")
-                .size(SIZE_SMALL)
-                .color(palette.primary),
-        ]
-        .spacing(8)
-        .into(),
-        DiffState::Loaded(diff) => column![
-            text("Branch diff").size(SIZE_HEADING).color(palette.text),
-            text(format!("Against {}", diff.base))
-                .size(SIZE_SMALL)
-                .color(dim(palette.text, 0.6)),
-            scrollable(
-                text(diff.contents.clone())
+        Some((key, worktree)) => {
+            let branch = worktree.branch.as_deref().unwrap_or("(detached HEAD)");
+            let changes = if worktree.dirty_files == 0 {
+                "clean".to_owned()
+            } else {
+                format!("{} uncommitted file(s)", worktree.dirty_files)
+            };
+            let ignored = if worktree.ignored_files == 0 {
+                "none".to_owned()
+            } else {
+                format!(
+                    "{} ignored entr{}",
+                    worktree.ignored_files,
+                    if worktree.ignored_files == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    }
+                )
+            };
+            let upstream = worktree
+                .upstream
+                .as_deref()
+                .unwrap_or(if worktree.has_remote {
+                    "no upstream branch"
+                } else {
+                    "no remote"
+                });
+            let sync = match (worktree.ahead, worktree.behind) {
+                (Some(ahead), Some(behind)) => format!("↑{ahead}  ↓{behind}"),
+                _ if worktree.upstream.is_some() => "unavailable".to_owned(),
+                _ => "not applicable".to_owned(),
+            };
+            let pull_request: Element<_> = match &state.pull_request {
+                PullRequestStatus::Idle => text("Pull request: not checked")
+                    .size(SIZE_SMALL)
+                    .color(dim(text_color, 0.6))
+                    .into(),
+                PullRequestStatus::Loading => text("Pull request: checking GitHub…")
+                    .size(SIZE_SMALL)
+                    .color(primary)
+                    .into(),
+                PullRequestStatus::NotFound => text("Pull request: none found")
+                    .size(SIZE_SMALL)
+                    .color(dim(text_color, 0.6))
+                    .into(),
+                PullRequestStatus::Error(error) => {
+                    text(format!("Pull request check failed: {error}"))
+                        .size(SIZE_SMALL)
+                        .color(danger)
+                        .into()
+                }
+                PullRequestStatus::Found(pull_request) => {
+                    let state_name = if pull_request.is_merged() {
+                        "merged"
+                    } else {
+                        &pull_request.state
+                    };
+                    let mut content = column![
+                        text(format!(
+                            "Pull request #{}: {state_name}",
+                            pull_request.number
+                        ))
+                        .size(SIZE_SMALL)
+                        .color(if pull_request.is_merged() {
+                            success
+                        } else {
+                            text_color
+                        }),
+                        rich_text([span(pull_request.url.clone())
+                            .color(primary)
+                            .underline(true)
+                            .link(pull_request.url.clone())])
+                        .size(SIZE_CAPTION)
+                        .on_link_click(Msg::OpenPullRequestUrl),
+                    ]
+                    .spacing(3);
+                    if pull_request.is_merged() && !worktree.is_main && worktree.branch.is_some() {
+                        content = content.push(action_button(
+                            "PR has been merged, remove the worktree and branch?",
+                            danger,
+                            Some(Msg::AskRemoveMergedWorktree(key.clone())),
+                        ));
+                    }
+                    content.into()
+                }
+            };
+
+            column![
+                text("Worktree details")
+                    .size(SIZE_HEADING)
+                    .color(text_color),
+                text(branch).size(SIZE_BODY).color(text_color),
+                text(worktree.path.to_string_lossy().into_owned())
                     .size(SIZE_CAPTION)
-                    .color(palette.text)
-            )
-            .height(Length::Fill),
-        ]
-        .spacing(8)
-        .height(Length::Fill)
-        .into(),
-        DiffState::Error(message) => column![
-            text("Branch diff").size(SIZE_HEADING).color(palette.text),
-            text(message.clone()).size(SIZE_SMALL).color(palette.danger),
-        ]
-        .spacing(8)
-        .into(),
+                    .color(dim(text_color, 0.6)),
+                text(format!("Changes: {changes}"))
+                    .size(SIZE_SMALL)
+                    .color(text_color),
+                text(format!("Ignored entries: {ignored}"))
+                    .size(SIZE_SMALL)
+                    .color(text_color),
+                text(format!("Upstream: {upstream}"))
+                    .size(SIZE_SMALL)
+                    .color(text_color),
+                text(format!("Sync: {sync}"))
+                    .size(SIZE_SMALL)
+                    .color(text_color),
+                pull_request,
+            ]
+            .spacing(8)
+            .into()
+        }
     };
 
     container(body)
@@ -1513,21 +1643,31 @@ fn modal_view<'a>(modal: &'a Modal, palette: &Palette) -> Element<'a, Msg> {
             path,
             dirty_files,
             ignored_files,
+            delete_branch,
             ..
         } => {
             let guarded = *dirty_files > 0 || *ignored_files > 0;
+            let branch_note = match delete_branch {
+                Some(branch) => format!(" The local branch {branch:?} will also be deleted."),
+                None => " The branch stays available.".to_owned(),
+            };
             let warning = if guarded {
                 format!(
-                    "This worktree has {dirty_files} uncommitted and {ignored_files} ignored file(s). Remove anyway? This runs Git with --force."
+                    "This worktree has {dirty_files} uncommitted and {ignored_files} ignored entr{}. Remove anyway? This runs Git with --force.{branch_note}",
+                    if *ignored_files == 1 { "y" } else { "ies" }
                 )
             } else {
-                "This removes the worktree through Git. The branch stays available.".to_owned()
+                format!("This removes the worktree through Git.{branch_note}")
             };
             container(
                 column![
-                    text("Remove worktree")
-                        .size(SIZE_HEADING)
-                        .color(palette.text),
+                    text(if delete_branch.is_some() {
+                        "Remove worktree and branch"
+                    } else {
+                        "Remove worktree"
+                    })
+                    .size(SIZE_HEADING)
+                    .color(palette.text),
                     text(path.to_string_lossy().into_owned())
                         .size(SIZE_SMALL)
                         .color(dim(palette.text, 0.65)),
@@ -1535,7 +1675,17 @@ fn modal_view<'a>(modal: &'a Modal, palette: &Palette) -> Element<'a, Msg> {
                     row![
                         action_button("Cancel", palette.primary, Some(Msg::DismissModal)),
                         action_button(
-                            if guarded { "Remove anyway" } else { "Remove" },
+                            if delete_branch.is_some() {
+                                if guarded {
+                                    "Remove anyway and delete branch"
+                                } else {
+                                    "Remove and delete branch"
+                                }
+                            } else if guarded {
+                                "Remove anyway"
+                            } else {
+                                "Remove"
+                            },
                             palette.danger,
                             Some(Msg::ConfirmRemoveWorktree),
                         ),
@@ -1656,6 +1806,21 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_a_merged_github_pull_request() {
+        let pull_request: PullRequest = serde_json::from_str(
+            r#"{"number":42,"url":"https://github.com/org/repo/pull/42","state":"MERGED","headRefName":"feature/merged","mergedAt":"2026-01-02T03:04:05Z"}"#,
+        )
+        .unwrap();
+        assert!(pull_request.is_merged());
+
+        let open_pull_request: PullRequest = serde_json::from_str(
+            r#"{"number":43,"url":"https://github.com/org/repo/pull/43","state":"OPEN","headRefName":"feature/open","mergedAt":null}"#,
+        )
+        .unwrap();
+        assert!(!open_pull_request.is_merged());
+    }
+
+    #[test]
     fn creates_refreshes_and_guardedly_removes_a_real_worktree() {
         let root = std::env::temp_dir().join(format!(
             "wtui-test-{}-{}",
@@ -1691,8 +1856,8 @@ mod tests {
         assert_eq!(created.dirty_files, 0);
 
         fs::write(worktree.join("uncommitted.txt"), "change\n").unwrap();
-        assert!(remove_worktree(root.clone(), worktree.clone(), false).is_err());
-        remove_worktree(root.clone(), worktree.clone(), true).unwrap();
+        assert!(remove_worktree(root.clone(), worktree.clone(), false, None).is_err());
+        remove_worktree(root.clone(), worktree.clone(), true, None).unwrap();
         assert!(!worktree.exists());
         fs::remove_dir_all(root).unwrap();
     }
