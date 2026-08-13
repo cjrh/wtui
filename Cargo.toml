@@ -21,6 +21,7 @@ dirs = "6"
 tokio = { version = "1", features = ["rt"] }
 wait-timeout = "0.2"
 open = "5"
+iced-dev-automation = { path = "../iced-dev-automation" }
 
 # Keep wtui easy to debug while compiling UI dependencies with release-level
 # optimisation. This prevents debug builds from causing visible UI lag.

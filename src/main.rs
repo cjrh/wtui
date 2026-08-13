@@ -22,6 +22,11 @@ use iced::{
     Alignment, Border, Color, Element, Length, Size, Subscription, Task, color, theme::Palette,
     time, window,
 };
+#[cfg(debug_assertions)]
+use iced_dev_automation::{
+    AutomationRequest, AutomationSocket, CapturedScreenshot, DevAutomation, DevOptions,
+    ScreenshotRequest, ScreenshotSocket,
+};
 use iced_themer::{ThemeConfig, Themed};
 use serde::{Deserialize, Serialize};
 use wait_timeout::ChildExt;
@@ -46,7 +51,46 @@ fn main() -> iced::Result {
     let boot_theme = Arc::clone(&config);
     let app_theme = Arc::clone(&config);
 
-    let app = iced::application(move || boot(Arc::clone(&boot_theme)), update, view)
+    #[cfg(debug_assertions)]
+    let app = {
+        let options = DevOptions::from_cli().unwrap_or_else(|error| {
+            eprintln!("wtui: {error}");
+            std::process::exit(2);
+        });
+        let screenshot_socket = options
+            .screenshot_socket
+            .map(ScreenshotSocket::bind)
+            .transpose()
+            .unwrap_or_else(|error| {
+                eprintln!("wtui: {error}");
+                std::process::exit(2);
+            });
+        let automation_socket = options
+            .automation_socket
+            .map(AutomationSocket::bind)
+            .transpose()
+            .unwrap_or_else(|error| {
+                eprintln!("wtui: {error}");
+                std::process::exit(2);
+            });
+
+        iced::application(
+            move || {
+                boot(
+                    Arc::clone(&boot_theme),
+                    screenshot_socket.clone(),
+                    automation_socket.clone(),
+                )
+            },
+            update,
+            view,
+        )
+    };
+
+    #[cfg(not(debug_assertions))]
+    let app = iced::application(move || boot(Arc::clone(&boot_theme)), update, view);
+
+    let app = app
         .title("wtui")
         .theme(move |_: &State| app_theme.theme())
         .subscription(subscription)
@@ -82,6 +126,10 @@ struct State {
     banner: Option<Banner>,
     config_saving: bool,
     config_dirty: bool,
+    #[cfg(debug_assertions)]
+    screenshot_socket: Option<ScreenshotSocket>,
+    #[cfg(debug_assertions)]
+    automation_socket: Option<AutomationSocket>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,7 +157,7 @@ struct Worktree {
     error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct WorktreeKey {
     root_id: String,
     path: PathBuf,
@@ -169,26 +217,33 @@ enum BannerLevel {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(debug_assertions, derive(DevAutomation))]
 enum Msg {
     ConfigLoaded(Result<LoadedRepositories, String>),
     ConfigSaved(Result<(), String>),
     ChooseRepository,
     RepositoryPicked(Option<PathBuf>),
     RepositoryAdded(Result<NewRepository, String>),
+    #[cfg_attr(debug_assertions, automation)]
     SelectRoot(String),
+    #[cfg_attr(debug_assertions, automation)]
     RefreshAll,
     Poll,
     RepositoryRefreshed {
         root_id: String,
         result: Result<Refresh, String>,
     },
+    #[cfg_attr(debug_assertions, automation)]
     ShowAddWorktree,
+    #[cfg_attr(debug_assertions, automation)]
     BranchChanged(String),
+    #[cfg_attr(debug_assertions, automation)]
     ConfirmAddWorktree,
     WorktreeAdded {
         root_id: String,
         result: Result<PathBuf, String>,
     },
+    #[cfg_attr(debug_assertions, automation)]
     WorktreeSelected(WorktreeKey),
     PullRequestLoaded {
         key: WorktreeKey,
@@ -204,10 +259,31 @@ enum Msg {
         path: PathBuf,
         result: Result<RemovalOutcome, String>,
     },
+    #[cfg_attr(debug_assertions, automation)]
     DismissModal,
+    #[cfg_attr(debug_assertions, automation)]
+    DismissBanner,
+    #[cfg(debug_assertions)]
+    AutomationRequested(AutomationRequest),
+    #[cfg(debug_assertions)]
+    ScreenshotRequested(ScreenshotRequest),
+    #[cfg(debug_assertions)]
+    ScreenshotCaptured {
+        request: ScreenshotRequest,
+        screenshot: CapturedScreenshot,
+    },
+    #[cfg(debug_assertions)]
+    ScreenshotFailed {
+        request: ScreenshotRequest,
+        error: String,
+    },
 }
 
-fn boot(theme: Arc<ThemeConfig>) -> (State, Task<Msg>) {
+fn boot(
+    theme: Arc<ThemeConfig>,
+    #[cfg(debug_assertions)] screenshot_socket: Option<ScreenshotSocket>,
+    #[cfg(debug_assertions)] automation_socket: Option<AutomationSocket>,
+) -> (State, Task<Msg>) {
     let state = State {
         theme,
         repositories: Vec::new(),
@@ -218,6 +294,10 @@ fn boot(theme: Arc<ThemeConfig>) -> (State, Task<Msg>) {
         banner: None,
         config_saving: false,
         config_dirty: false,
+        #[cfg(debug_assertions)]
+        screenshot_socket,
+        #[cfg(debug_assertions)]
+        automation_socket,
     };
 
     // `load_configured_repositories` reads files and validates Git roots. It is
@@ -228,8 +308,32 @@ fn boot(theme: Arc<ThemeConfig>) -> (State, Task<Msg>) {
     )
 }
 
-fn subscription(_state: &State) -> Subscription<Msg> {
-    time::every(POLL_INTERVAL).map(|_| Msg::Poll)
+fn subscription(state: &State) -> Subscription<Msg> {
+    let poll = time::every(POLL_INTERVAL).map(|_| Msg::Poll);
+
+    #[cfg(debug_assertions)]
+    {
+        let screenshots = state
+            .screenshot_socket
+            .as_ref()
+            .map_or_else(Subscription::none, |socket| {
+                socket.subscription().map(Msg::ScreenshotRequested)
+            });
+        let automation = state
+            .automation_socket
+            .as_ref()
+            .map_or_else(Subscription::none, |socket| {
+                socket.subscription().map(Msg::AutomationRequested)
+            });
+
+        Subscription::batch([poll, screenshots, automation])
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = state;
+        poll
+    }
 }
 
 /// Run synchronous system work on Tokio's blocking worker pool. Keep every
@@ -599,6 +703,66 @@ fn update(state: &mut State, msg: Msg) -> Task<Msg> {
         }
         Msg::DismissModal => {
             state.modal = None;
+            Task::none()
+        }
+        Msg::DismissBanner => {
+            state.banner = None;
+            Task::none()
+        }
+        #[cfg(debug_assertions)]
+        Msg::AutomationRequested(request) => {
+            if !request.begin_dispatch() {
+                return Task::none();
+            }
+
+            if request.is_describe() {
+                request.respond_ok(Msg::automation_schema());
+                Task::none()
+            } else {
+                let value = request
+                    .dispatch_value()
+                    .expect("non-schema automation requests have a message")
+                    .clone();
+
+                match Msg::from_automation_value(value) {
+                    Ok(message) => {
+                        let task = update(state, message);
+                        request.respond_ok(serde_json::json!({ "accepted": true }));
+                        task
+                    }
+                    Err(error) => {
+                        request.respond_error("invalid_message", error.to_string());
+                        Task::none()
+                    }
+                }
+            }
+        }
+        #[cfg(debug_assertions)]
+        Msg::ScreenshotRequested(request) => window::oldest().then(move |id| {
+            let request = request.clone();
+
+            match id {
+                Some(id) => window::screenshot(id).map(move |screenshot| Msg::ScreenshotCaptured {
+                    request: request.clone(),
+                    screenshot: screenshot.into(),
+                }),
+                None => Task::done(Msg::ScreenshotFailed {
+                    request,
+                    error: "no application window is open".to_owned(),
+                }),
+            }
+        }),
+        #[cfg(debug_assertions)]
+        Msg::ScreenshotCaptured {
+            request,
+            screenshot,
+        } => {
+            request.respond(Ok(screenshot));
+            Task::none()
+        }
+        #[cfg(debug_assertions)]
+        Msg::ScreenshotFailed { request, error } => {
+            request.respond(Err(error));
             Task::none()
         }
     }
@@ -1207,22 +1371,41 @@ fn banner_view<'a>(banner: &Banner, palette: &Palette) -> Element<'a, Msg> {
         BannerLevel::Error => palette.danger,
         BannerLevel::Info => palette.primary,
     };
-    container(
-        text(banner.message.clone())
-            .size(SIZE_SMALL)
-            .color(palette.text),
+    let text_color = palette.text;
+
+    button(
+        row![
+            text(banner.message.clone())
+                .size(SIZE_SMALL)
+                .color(text_color)
+                .width(Length::Fill),
+            text("Dismiss")
+                .size(SIZE_CAPTION)
+                .color(dim(text_color, 0.65)),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
     )
     .padding([8, 12])
     .width(Length::Fill)
-    .style(move |_| container::Style {
-        background: Some(dim(accent, 0.15).into()),
-        border: Border {
-            radius: 8.0.into(),
-            width: 1.0,
-            color: dim(accent, 0.4),
-        },
-        ..container::Style::default()
+    .style(move |_, status| {
+        let background = match status {
+            button::Status::Hovered => dim(accent, 0.23),
+            button::Status::Pressed => dim(accent, 0.3),
+            button::Status::Disabled | button::Status::Active => dim(accent, 0.15),
+        };
+
+        button::Style {
+            background: Some(background.into()),
+            border: Border {
+                radius: 8.0.into(),
+                width: 1.0,
+                color: dim(accent, 0.4),
+            },
+            ..button::Style::default()
+        }
     })
+    .on_press(Msg::DismissBanner)
     .into()
 }
 
@@ -1425,10 +1608,7 @@ fn worktree_card<'a>(
     .on_press(Msg::WorktreeSelected(key.clone()));
 
     let remove: Element<_> = if worktree.is_main {
-        text("root")
-            .size(SIZE_CAPTION)
-            .color(dim(text_color, 0.55))
-            .into()
+        status_badge("Root", primary, text_color)
     } else {
         action_button(
             "Remove",
@@ -1480,15 +1660,29 @@ fn worktree_details_panel<'a>(state: &'a State, palette: &Palette) -> Element<'a
         .as_ref()
         .and_then(|key| find_worktree(state, key).map(|worktree| (key, worktree)))
     {
-        None => column![
-            text("Worktree details")
-                .size(SIZE_HEADING)
-                .color(text_color),
-            text("Select a worktree to see its status and pull request.")
-                .size(SIZE_SMALL)
-                .color(dim(text_color, 0.6)),
-        ]
-        .spacing(8)
+        None => container(
+            column![
+                text("No worktree selected")
+                    .size(SIZE_HEADING)
+                    .color(text_color),
+                text("Select a worktree to inspect its status and pull request.")
+                    .size(SIZE_SMALL)
+                    .color(dim(text_color, 0.6)),
+            ]
+            .spacing(6),
+        )
+        .padding(20)
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(dim(primary, 0.08).into()),
+            border: Border {
+                radius: 10.0.into(),
+                width: 1.0,
+                color: dim(primary, 0.25),
+            },
+            ..container::Style::default()
+        })
+        .center_y(Length::Fill)
         .into(),
         Some((key, worktree)) => {
             let branch = worktree.branch.as_deref().unwrap_or("(detached HEAD)");
@@ -1721,6 +1915,21 @@ fn modal_view<'a>(modal: &'a Modal, palette: &Palette) -> Element<'a, Msg> {
     .into()
 }
 
+fn status_badge<'a>(label: &'a str, accent: Color, text_color: Color) -> Element<'a, Msg> {
+    container(text(label).size(SIZE_CAPTION).color(text_color))
+        .padding([5, 8])
+        .style(move |_| container::Style {
+            background: Some(dim(accent, 0.14).into()),
+            border: Border {
+                radius: 6.0.into(),
+                width: 1.0,
+                color: dim(accent, 0.35),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
 fn action_button<'a>(label: &str, accent: Color, on_press: Option<Msg>) -> Element<'a, Msg> {
     let mut action = button(text(label.to_owned()).size(SIZE_SMALL))
         .padding([8, 12])
@@ -1766,6 +1975,126 @@ fn scale(color: Color, factor: f32) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[allow(dead_code)]
+    #[derive(Debug, DevAutomation)]
+    enum DeriveFixture {
+        #[automation]
+        Unit,
+        #[automation]
+        Newtype(String),
+        #[automation]
+        Tuple(String, u32),
+        #[automation]
+        Named {
+            enabled: bool,
+            label: String,
+        },
+        Hidden(String),
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn derive_macro_supports_each_variant_shape() {
+        assert!(matches!(
+            DeriveFixture::from_automation_value(serde_json::json!({ "variant": "Unit" })),
+            Ok(DeriveFixture::Unit)
+        ));
+        assert!(matches!(
+            DeriveFixture::from_automation_value(
+                serde_json::json!({ "variant": "Newtype", "value": "text" })
+            ),
+            Ok(DeriveFixture::Newtype(value)) if value == "text"
+        ));
+        assert!(matches!(
+            DeriveFixture::from_automation_value(
+                serde_json::json!({ "variant": "Tuple", "value": ["text", 7] })
+            ),
+            Ok(DeriveFixture::Tuple(value, 7)) if value == "text"
+        ));
+        assert!(matches!(
+            DeriveFixture::from_automation_value(serde_json::json!({
+                "variant": "Named",
+                "value": { "enabled": true, "label": "text" },
+            })),
+            Ok(DeriveFixture::Named { enabled: true, label }) if label == "text"
+        ));
+        assert!(
+            DeriveFixture::from_automation_value(serde_json::json!({
+                "variant": "Hidden",
+                "value": "secret",
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn dismissing_a_banner_clears_it() {
+        let theme = Arc::new(THEME_TOML.parse::<ThemeConfig>().expect("theme must parse"));
+        let (mut state, _) = boot(
+            theme,
+            #[cfg(debug_assertions)]
+            None,
+            #[cfg(debug_assertions)]
+            None,
+        );
+        state.banner = Some(Banner {
+            level: BannerLevel::Info,
+            message: "Dismiss me".to_owned(),
+        });
+
+        let _ = update(&mut state, Msg::DismissBanner);
+
+        assert!(state.banner.is_none());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn automation_dispatcher_accepts_only_annotated_messages() {
+        assert!(matches!(
+            Msg::from_automation_value(serde_json::json!({ "variant": "RefreshAll" })),
+            Ok(Msg::RefreshAll)
+        ));
+        assert!(matches!(
+            Msg::from_automation_value(
+                serde_json::json!({ "variant": "BranchChanged", "value": "feature/new-ui" })
+            ),
+            Ok(Msg::BranchChanged(branch)) if branch == "feature/new-ui"
+        ));
+        assert!(matches!(
+            Msg::from_automation_value(serde_json::json!({
+                "variant": "WorktreeSelected",
+                "value": { "root_id": "botanic", "path": "/repos/botanic" },
+            })),
+            Ok(Msg::WorktreeSelected(key))
+                if key.root_id == "botanic" && key.path.as_path() == Path::new("/repos/botanic")
+        ));
+        assert!(
+            Msg::from_automation_value(serde_json::json!({
+                "variant": "ConfigLoaded",
+                "value": { "Ok": { "repositories": [], "warnings": [] } },
+            }))
+            .is_err()
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn automation_schema_lists_annotated_messages() {
+        let schema = Msg::automation_schema();
+        let variants = schema["variants"]
+            .as_array()
+            .expect("schema variants must be an array");
+        let names = variants
+            .iter()
+            .filter_map(|variant| variant["variant"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"RefreshAll"));
+        assert!(names.contains(&"DismissBanner"));
+        assert!(!names.contains(&"ConfigLoaded"));
+    }
 
     #[test]
     fn slugifies_branch_names_for_sibling_paths() {
